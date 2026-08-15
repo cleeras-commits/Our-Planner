@@ -654,6 +654,32 @@ body {
 }
 .settings-btn:hover { border-color: var(--soft-coral); color: var(--soft-coral); }
 
+/* ─── SYNC INDICATOR ─── */
+.sync-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-light);
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: var(--cream);
+  transition: all 0.3s;
+}
+.sync-status.synced { color: var(--sage); }
+.sync-status.syncing { color: var(--honey); }
+.sync-status.error { color: var(--soft-coral); }
+.sync-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-light);
+  transition: background 0.3s;
+}
+.sync-status.synced .sync-dot { background: var(--sage); }
+.sync-status.syncing .sync-dot { background: var(--honey); animation: pulse-dot 1s infinite; }
+.sync-status.error .sync-dot { background: var(--soft-coral); }
+@keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
 /* ─── TOUCH DRAG ─── */
 .card.touch-dragging {
   position: fixed;
@@ -1383,6 +1409,7 @@ body {
       </div>
     </div>
     <div class="header-right">
+      <div class="sync-status" id="sync-status" title="Sync status"><div class="sync-dot"></div><span id="sync-label">Offline</span></div>
       <button class="settings-btn" onclick="openSettings()">⚙️ Names</button>
     </div>
   </div>
@@ -1711,7 +1738,7 @@ function checkLogin() {
   const input = document.getElementById('login-password');
   if (input.value === APP_PASSWORD) {
     document.getElementById('login-overlay').style.display = 'none';
-    sessionStorage.setItem('planner-auth', 'yes');
+    localStorage.setItem('planner-auth', 'yes');
     input.value = '';
   } else {
     document.getElementById('login-error').style.display = 'block';
@@ -1720,8 +1747,8 @@ function checkLogin() {
   }
 }
 
-// Auto-login if already authenticated this session
-if (sessionStorage.getItem('planner-auth') === 'yes') {
+// Auto-login if already authenticated on this device
+if (localStorage.getItem('planner-auth') === 'yes') {
   document.getElementById('login-overlay').style.display = 'none';
 }
 
@@ -1793,14 +1820,43 @@ function isToday(d) {
   return d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
 }
 
-// ─── PERSISTENCE ───
-function saveLocal() {
-  localStorage.setItem('our-planner-tasks', JSON.stringify(tasks));
-  localStorage.setItem('our-planner-meals', JSON.stringify(meals));
-  localStorage.setItem('our-planner-names', JSON.stringify(names));
-  localStorage.setItem('our-planner-events', JSON.stringify(calEvents));
-  localStorage.setItem('our-planner-pto', JSON.stringify(pto));
+// ─── SYNC STATUS UI ───
+function setSyncStatus(status, label) {
+  const el = document.getElementById('sync-status');
+  const lbl = document.getElementById('sync-label');
+  if (!el) return;
+  el.className = 'sync-status ' + status;
+  lbl.textContent = label || status;
 }
+
+// ─── PERSISTENCE WITH BACKUPS ───
+let _localSaveTs = 0; // timestamp of last local save
+
+function saveLocal() {
+  _localSaveTs = Date.now();
+  const snapshot = {
+    tasks: JSON.stringify(tasks),
+    meals: JSON.stringify(meals),
+    names: JSON.stringify(names),
+    events: JSON.stringify(calEvents),
+    pto: JSON.stringify(pto),
+    savedAt: _localSaveTs
+  };
+  localStorage.setItem('our-planner-tasks', snapshot.tasks);
+  localStorage.setItem('our-planner-meals', snapshot.meals);
+  localStorage.setItem('our-planner-names', snapshot.names);
+  localStorage.setItem('our-planner-events', snapshot.events);
+  localStorage.setItem('our-planner-pto', snapshot.pto);
+  localStorage.setItem('our-planner-savedAt', String(_localSaveTs));
+  // Rolling backup — keep last 3 snapshots so data is never truly lost
+  try {
+    const backups = JSON.parse(localStorage.getItem('our-planner-backups') || '[]');
+    backups.push(snapshot);
+    if (backups.length > 3) backups.shift();
+    localStorage.setItem('our-planner-backups', JSON.stringify(backups));
+  } catch(e) { /* storage full — skip backup */ }
+}
+
 function loadLocal() {
   try {
     const t = localStorage.getItem('our-planner-tasks');
@@ -1813,12 +1869,15 @@ function loadLocal() {
     if (e) calEvents = JSON.parse(e);
     const p = localStorage.getItem('our-planner-pto');
     if (p) pto = JSON.parse(p);
+    const ts = localStorage.getItem('our-planner-savedAt');
+    if (ts) _localSaveTs = parseInt(ts);
   } catch(e) {}
 }
 
 // ─── SUPABASE SYNC ───
 async function saveRemote() {
   if (!syncEnabled) return;
+  setSyncStatus('syncing', 'Saving…');
   const payload = {
     id: PLANNER_ID,
     tasks: JSON.stringify(tasks),
@@ -1828,23 +1887,65 @@ async function saveRemote() {
     pto: JSON.stringify(pto),
     updated_at: new Date().toISOString()
   };
-  await sb.from('planners').upsert(payload, { onConflict: 'id' });
+  try {
+    const { error } = await sb.from('planners').upsert(payload, { onConflict: 'id' });
+    if (error) {
+      console.error('Remote save failed:', error);
+      setSyncStatus('error', 'Sync failed');
+    } else {
+      setSyncStatus('synced', 'Saved');
+    }
+  } catch(e) {
+    console.error('Remote save error:', e);
+    setSyncStatus('error', 'Offline');
+  }
 }
 
 async function loadRemote() {
   if (!syncEnabled) return false;
+  setSyncStatus('syncing', 'Loading…');
   try {
     const { data, error } = await sb.from('planners').select('*').eq('id', PLANNER_ID).single();
-    if (error || !data) return false;
-    tasks = JSON.parse(data.tasks || '[]');
-    meals = JSON.parse(data.meals || '[]');
+    if (error || !data) {
+      setSyncStatus('error', 'Load failed');
+      return false;
+    }
+    const remoteTasks = JSON.parse(data.tasks || '[]');
+    const remoteMeals = JSON.parse(data.meals || '[]');
+    const remoteEvents = JSON.parse(data.events || '[]');
+
+    // Don't overwrite local data with empty remote data (protects against DB resets)
+    const localHasData = tasks.length > 0 || meals.length > 0 || calEvents.length > 0;
+    const remoteHasData = remoteTasks.length > 0 || remoteMeals.length > 0 || remoteEvents.length > 0;
+    if (localHasData && !remoteHasData) {
+      console.warn('Remote data is empty but local has data — keeping local and re-uploading');
+      saveRemote();
+      return false;
+    }
+
+    // Compare timestamps: if local is newer, keep local and push it up
+    const remoteTs = data.updated_at ? new Date(data.updated_at).getTime() : 0;
+    if (_localSaveTs > 0 && _localSaveTs > remoteTs && localHasData) {
+      console.warn('Local data is newer than remote — keeping local and re-uploading');
+      setSyncStatus('syncing', 'Pushing local…');
+      saveRemote();
+      return false;
+    }
+
+    tasks = remoteTasks;
+    meals = remoteMeals;
+    calEvents = remoteEvents;
     names = JSON.parse(data.names || '{}') || { nico: 'Nico', partner: 'Charlee' };
-    calEvents = JSON.parse(data.events || '[]');
     pto = JSON.parse(data.pto || '{}');
     if (!pto.nico) pto.nico = { vacation: 25, personal: 5, carryover: 0 };
     if (!pto.partner) pto.partner = { vacation: 25, personal: 5, fridays: 0, agency: 0 };
+    setSyncStatus('synced', 'Synced');
     return true;
-  } catch(e) { console.warn('Remote load failed, using local', e); return false; }
+  } catch(e) {
+    console.warn('Remote load failed, using local', e);
+    setSyncStatus('error', 'Offline');
+    return false;
+  }
 }
 
 function save() {
@@ -1861,20 +1962,36 @@ async function load() {
   updateNames();
 }
 
+let _remoteRenderTimer = null;
 function applyRemoteData(data) {
   try {
-    tasks = JSON.parse(data.tasks || '[]');
-    meals = JSON.parse(data.meals || '[]');
+    const remoteTasks = JSON.parse(data.tasks || '[]');
+    const remoteMeals = JSON.parse(data.meals || '[]');
+    const remoteEvents = JSON.parse(data.events || '[]');
+    // Don't wipe local data if remote comes in empty
+    const localHasData = tasks.length > 0 || meals.length > 0 || calEvents.length > 0;
+    const remoteHasData = remoteTasks.length > 0 || remoteMeals.length > 0 || remoteEvents.length > 0;
+    if (localHasData && !remoteHasData) {
+      console.warn('Ignoring empty remote update — local data preserved');
+      return;
+    }
+    tasks = remoteTasks;
+    meals = remoteMeals;
+    calEvents = remoteEvents;
     names = JSON.parse(data.names || '{}') || { nico: 'Nico', partner: 'Charlee' };
-    calEvents = JSON.parse(data.events || '[]');
     pto = JSON.parse(data.pto || '{}');
     if (!pto.nico) pto.nico = { vacation: 25, personal: 5, carryover: 0 };
     if (!pto.partner) pto.partner = { vacation: 25, personal: 5, fridays: 0, agency: 0 };
     saveLocal();
-    updateNames();
-    renderBoard();
-    if (currentView === 'meals') renderMeals();
-    if (currentView === 'calendar') renderCalendar(undefined, true);
+    setSyncStatus('synced', 'Synced');
+    // Debounce renders from rapid remote updates
+    clearTimeout(_remoteRenderTimer);
+    _remoteRenderTimer = setTimeout(() => {
+      updateNames();
+      renderBoard();
+      if (currentView === 'meals') renderMeals();
+      if (currentView === 'calendar') renderCalendar(undefined, true);
+    }, 300);
   } catch(e) { console.warn('Failed to apply remote data', e); }
 }
 
@@ -1913,8 +2030,10 @@ function switchView(view, btn) {
   } else if (view === 'calendar') {
     document.getElementById('cal-view').classList.add('active');
     calMonthOffset = 0;
-    renderCalendar(0);
     updateStickyTop();
+    renderCalendar(0);
+    // Re-update sticky after layout settles
+    requestAnimationFrame(() => updateStickyTop());
   }
 }
 
@@ -2581,10 +2700,10 @@ function renderBoard() {
   });
 }
 
+const _escDiv = document.createElement('div');
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  _escDiv.textContent = str;
+  return _escDiv.innerHTML;
 }
 
 // ─── CALENDAR ───
@@ -2984,8 +3103,8 @@ function renderCalendar(centerOffset, skipScroll) {
   };
   const ptoIcons = { vacation:'🏖️', personal:'🙋', carryover:'🔄', friday:'☀️', agency:'🏢' };
   const MAX_LANES = 3;
-  const MONTHS_BEFORE = 2;
-  const MONTHS_AFTER = 12;
+  const MONTHS_BEFORE = 1;
+  const MONTHS_AFTER = 3;
 
   // Update month label to current offset
   const curMonth = getCalMonth();
@@ -3227,34 +3346,47 @@ function renderCalendar(centerOffset, skipScroll) {
     window._calObserver.observe(el);
   });
 
-  // Also use a scroll listener for more reliable month label updates
+  // Also use a scroll listener for more reliable month label updates (throttled)
   if (window._calScrollHandler) window.removeEventListener('scroll', window._calScrollHandler);
+  let _scrollTick = false;
   window._calScrollHandler = () => {
-    let best = null;
-    document.querySelectorAll('.cal-month-sep').forEach(el => {
-      const rect = el.getBoundingClientRect();
-      if (rect.top < topMargin + 100) best = el;
+    if (_scrollTick) return;
+    _scrollTick = true;
+    requestAnimationFrame(() => {
+      _scrollTick = false;
+      let best = null;
+      document.querySelectorAll('.cal-month-sep').forEach(el => {
+        const rect = el.getBoundingClientRect();
+        if (rect.top < topMargin + 100) best = el;
+      });
+      if (best) {
+        const mo = parseInt(best.dataset.month);
+        const yr = parseInt(best.dataset.year);
+        const off = parseInt(best.dataset.offset);
+        document.getElementById('month-label').textContent = `${monthNames[mo]} ${yr}`;
+        calMonthOffset = off;
+      }
     });
-    if (best) {
-      const mo = parseInt(best.dataset.month);
-      const yr = parseInt(best.dataset.year);
-      const off = parseInt(best.dataset.offset);
-      document.getElementById('month-label').textContent = `${monthNames[mo]} ${yr}`;
-      calMonthOffset = off;
-    }
   };
   window.addEventListener('scroll', window._calScrollHandler, { passive: true });
 
   // Scroll to center month without animation on initial render
-  if (!skipScroll) requestAnimationFrame(() => {
-    const target = document.getElementById('cal-month-' + calMonthOffset);
-    if (target) {
-      const headerH = header ? header.offsetHeight : 0;
-      const stickyH = stickyBar ? stickyBar.offsetHeight : 0;
-      const top = target.getBoundingClientRect().top + window.scrollY - headerH - stickyH - 4;
-      window.scrollTo({ top, behavior: 'instant' });
-    }
-  });
+  if (!skipScroll) {
+    // Use double-rAF + small delay to ensure layout is fully settled
+    requestAnimationFrame(() => { requestAnimationFrame(() => {
+      setTimeout(() => {
+        const target = document.getElementById('cal-month-' + calMonthOffset);
+        if (target) {
+          const hdr = document.querySelector('.header');
+          const stk = document.getElementById('cal-sticky-bar');
+          const headerH = hdr ? hdr.offsetHeight : 0;
+          const stickyH = stk ? stk.offsetHeight : 0;
+          const top = target.getBoundingClientRect().top + window.scrollY - headerH - stickyH - 4;
+          window.scrollTo({ top, behavior: 'instant' });
+        }
+      }, 50);
+    }); });
+  }
 
   document.querySelectorAll('.cal-cat-nico-label').forEach(el => el.textContent = names.nico);
   document.querySelectorAll('.cal-cat-partner-label').forEach(el => el.textContent = names.partner);
@@ -3283,3 +3415,4 @@ document.addEventListener('keydown', e => {
 </script>
 </body>
 </html>
+
